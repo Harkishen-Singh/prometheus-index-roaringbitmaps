@@ -166,6 +166,7 @@ func TestIndexRW_Create_Open(t *testing.T) {
 }
 
 func TestIndexRW_Postings(t *testing.T) {
+	fmt.Println("start")
 	dir, err := ioutil.TempDir("", "test_index_postings")
 	require.NoError(t, err)
 	defer func() {
@@ -198,18 +199,23 @@ func TestIndexRW_Postings(t *testing.T) {
 	require.NoError(t, iw.AddSeries(3, series[2]))
 	require.NoError(t, iw.AddSeries(4, series[3]))
 
+	fmt.Println("before close")
 	require.NoError(t, iw.Close())
+	fmt.Println("after close")
 
 	ir, err := NewFileReader(fn)
 	require.NoError(t, err)
 
+	fmt.Println("1")
 	p, err := ir.Postings("a", "1")
 	require.NoError(t, err)
+	fmt.Println("2")
 
 	var l labels.Labels
 	var c []chunks.Meta
 
 	for i := 0; p.Next(); i++ {
+		fmt.Println("at is", p.At())
 		err := ir.Series(p.At(), &l, &c)
 
 		require.NoError(t, err)

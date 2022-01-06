@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"github.com/dgraph-io/sroar"
 	"hash"
 	"hash/crc32"
 	"io"
@@ -27,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"unsafe"
 
 	"github.com/pkg/errors"
@@ -376,9 +378,11 @@ func (w *Writer) ensureStage(s indexWriterStage) error {
 		w.toc.LabelIndices = w.f.pos
 		// LabelIndices generation depends on the posting offset
 		// table produced at this stage.
+		fmt.Println("start writePostingsToTmpFiles")
 		if err := w.writePostingsToTmpFiles(); err != nil {
 			return err
 		}
+		fmt.Println("emd writePostingsToTmpFiles")
 		if err := w.writeLabelIndices(); err != nil {
 			return err
 		}
@@ -815,6 +819,12 @@ func (w *Writer) writeTOC() error {
 	return w.write(w.buf1.Get())
 }
 
+var bitmapPool = sync.Pool {
+	New: func() interface {} {
+		return sroar.NewBitmap()
+	},
+}
+
 func (w *Writer) writePostingsToTmpFiles() error {
 	names := make([]string, 0, len(w.labelNames))
 	for n := range w.labelNames {
@@ -832,7 +842,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 	defer f.Close()
 
 	// Write out the special all posting.
-	offsets := []uint32{}
+	offsets := bitmapPool.Get().(*sroar.Bitmap)
 	d := encoding.NewDecbufRaw(realByteSlice(f.Bytes()), int(w.toc.LabelIndices))
 	d.Skip(int(w.toc.Series))
 	for d.Len() > 0 {
@@ -841,7 +851,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 		if startPos%16 != 0 {
 			return errors.Errorf("series not 16-byte aligned at %d", startPos)
 		}
-		offsets = append(offsets, uint32(startPos/16))
+		offsets.Set(startPos/16)
 		// Skip to next series.
 		x := d.Uvarint()
 		d.Skip(x + crc32.Size)
@@ -852,15 +862,20 @@ func (w *Writer) writePostingsToTmpFiles() error {
 	if err := w.writePosting("", "", offsets); err != nil {
 		return err
 	}
-	maxPostings := uint64(len(offsets)) // No label name can have more postings than this.
+	maxPostings := uint64(offsets.GetCardinality()) // No label name can have more postings than this.
+
+	offsets.Reset()
+	bitmapPool.Put(offsets)
 
 	for len(names) > 0 {
+		fmt.Println("into loop", names)
 		batchNames := []string{}
 		var c uint64
 		// Try to bunch up label names into one loop, but avoid
 		// using more memory than a single label name can.
 		for len(names) > 0 {
 			if w.labelNames[names[0]]+c > maxPostings {
+				fmt.Println("breaking")
 				break
 			}
 			batchNames = append(batchNames, names[0])
@@ -877,7 +892,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 			nameSymbols[sid] = name
 		}
 		// Label name -> label value -> positions.
-		postings := map[uint32]map[uint32][]uint32{}
+		postings := map[uint32]map[uint32]*sroar.Bitmap{}
 
 		d := encoding.NewDecbufRaw(realByteSlice(f.Bytes()), int(w.toc.LabelIndices))
 		d.Skip(int(w.toc.Series))
@@ -895,9 +910,15 @@ func (w *Writer) writePostingsToTmpFiles() error {
 
 				if _, ok := nameSymbols[lno]; ok {
 					if _, ok := postings[lno]; !ok {
-						postings[lno] = map[uint32][]uint32{}
+						postings[lno] = map[uint32]*sroar.Bitmap{}
 					}
-					postings[lno][lvo] = append(postings[lno][lvo], uint32(startPos/16))
+					if _, ok := postings[lno][lvo]; !ok {
+						postings[lno][lvo] = bitmapPool.Get().(*sroar.Bitmap)
+					}
+
+					fmt.Println("setting", startPos / 16)
+					postings[lno][lvo].Set(startPos / 16)
+					//postings[lno][lvo] = append(postings[lno][lvo], uint32(startPos/16))
 				}
 			}
 			// Skip to next series.
@@ -924,9 +945,11 @@ func (w *Writer) writePostingsToTmpFiles() error {
 				if err != nil {
 					return err
 				}
+				fmt.Println("writing")
 				if err := w.writePosting(name, value, postings[sid][v]); err != nil {
 					return err
 				}
+				fmt.Println("writing done")
 			}
 		}
 		select {
@@ -939,7 +962,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 	return nil
 }
 
-func (w *Writer) writePosting(name, value string, offs []uint32) error {
+func (w *Writer) writePosting(name, value string, correspondingSeriesIds *sroar.Bitmap) error {
 	// Align beginning to 4 bytes for more efficient postings list scans.
 	if err := w.fP.AddPadding(4); err != nil {
 		return err
@@ -957,17 +980,23 @@ func (w *Writer) writePosting(name, value string, offs []uint32) error {
 	w.cntPO++
 
 	w.buf1.Reset()
-	w.buf1.PutBE32int(len(offs))
+	w.buf1.PutBE32int(correspondingSeriesIds.GetCardinality())
 
-	for _, off := range offs {
-		if off > (1<<32)-1 {
-			return errors.Errorf("series offset %d exceeds 4 bytes", off)
-		}
-		w.buf1.PutBE32(off)
-	}
+	//for _, seriesId := range correspondingSeriesIds {
+	//	if seriesId > (1<<32)-1 {
+	//		return errors.Errorf("series offset %d exceeds 4 bytes", seriesId)
+	//	}
+	//	w.buf1.PutBE32(seriesId)
+	//}
+	w.buf1.PutBytes(correspondingSeriesIds.ToBuffer()) // Harkishen: Change this to ToBufferWithCopy if values are lost.
 
 	w.buf2.Reset()
 	l := w.buf1.Len()
+
+	// Close bitmaps.
+	correspondingSeriesIds.Reset()
+	bitmapPool.Put(correspondingSeriesIds)
+
 	// We convert to uint to make code compile on 32-bit systems, as math.MaxUint32 doesn't fit into int there.
 	if uint(l) > math.MaxUint32 {
 		return errors.Errorf("posting size exceeds 4 bytes: %d", l)
@@ -1789,7 +1818,7 @@ func (dec *Decoder) Postings(b []byte) (int, Postings, error) {
 	if len(l) != 4*n {
 		return 0, nil, fmt.Errorf("unexpected postings length, should be %d bytes for %d postings, got %d bytes", 4*n, n, len(l))
 	}
-	return n, newBigEndianPostings(l), nil
+	return n, newRoaringBitmapPostings(l), nil
 }
 
 // LabelNamesOffsetsFor decodes the offsets of the name symbols for a given series.
