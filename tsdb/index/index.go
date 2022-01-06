@@ -859,10 +859,11 @@ func (w *Writer) writePostingsToTmpFiles() error {
 			return err
 		}
 	}
+	maxPostings := uint64(offsets.GetCardinality()) // No label name can have more postings than this.
+	fmt.Println("max postings", maxPostings)
 	if err := w.writePosting("", "", offsets); err != nil {
 		return err
 	}
-	maxPostings := uint64(offsets.GetCardinality()) // No label name can have more postings than this.
 
 	offsets.Reset()
 	bitmapPool.Put(offsets)
@@ -880,6 +881,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 			}
 			batchNames = append(batchNames, names[0])
 			c += w.labelNames[names[0]]
+			fmt.Println("trimmed")
 			names = names[1:]
 		}
 
@@ -949,6 +951,8 @@ func (w *Writer) writePostingsToTmpFiles() error {
 				if err := w.writePosting(name, value, postings[sid][v]); err != nil {
 					return err
 				}
+				postings[sid][v].Reset()
+				bitmapPool.Put(postings[sid][v])
 				fmt.Println("writing done")
 			}
 		}
@@ -967,6 +971,7 @@ func (w *Writer) writePosting(name, value string, correspondingSeriesIds *sroar.
 	if err := w.fP.AddPadding(4); err != nil {
 		return err
 	}
+	fmt.Println("writing", correspondingSeriesIds.ToArray())
 
 	// Write out postings offset table to temporary file as we go.
 	w.buf1.Reset()
@@ -992,10 +997,6 @@ func (w *Writer) writePosting(name, value string, correspondingSeriesIds *sroar.
 
 	w.buf2.Reset()
 	l := w.buf1.Len()
-
-	// Close bitmaps.
-	correspondingSeriesIds.Reset()
-	bitmapPool.Put(correspondingSeriesIds)
 
 	// We convert to uint to make code compile on 32-bit systems, as math.MaxUint32 doesn't fit into int there.
 	if uint(l) > math.MaxUint32 {
@@ -1642,6 +1643,7 @@ func (r *Reader) Series(id storage.SeriesRef, lbls *labels.Labels, chks *[]chunk
 	}
 	d := encoding.NewDecbufUvarintAt(r.b, int(offset), castagnoliTable)
 	if d.Err() != nil {
+		fmt.Println("from here", d.Err())
 		return d.Err()
 	}
 	return errors.Wrap(r.dec.Series(d.Get(), lbls, chks), "read series")
@@ -1815,10 +1817,12 @@ func (dec *Decoder) Postings(b []byte) (int, Postings, error) {
 	if d.Err() != nil {
 		return 0, nil, d.Err()
 	}
-	if len(l) != 4*n {
-		return 0, nil, fmt.Errorf("unexpected postings length, should be %d bytes for %d postings, got %d bytes", 4*n, n, len(l))
-	}
-	return n, newRoaringBitmapPostings(l), nil
+	//if len(l) != 4*n {
+	//	return 0, nil, fmt.Errorf("unexpected postings length, should be %d bytes for %d postings, got %d bytes", 4*n, n, len(l))
+	//}
+	np := newRoaringBitmapPostings(l)
+	fmt.Println("cardinality is", np.bitmap.GetCardinality(), "reading", np.bitmap.ToArray())
+	return n, np, nil
 }
 
 // LabelNamesOffsetsFor decodes the offsets of the name symbols for a given series.

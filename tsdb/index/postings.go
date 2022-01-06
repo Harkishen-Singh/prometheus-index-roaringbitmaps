@@ -785,10 +785,11 @@ type roaringBitmapPostings struct {
 }
 
 func newRoaringBitmapPostings(l []byte) *roaringBitmapPostings {
+	bitmap := sroar.FromBuffer(l)
 	bm := &roaringBitmapPostings{
-		bitmap: sroar.FromBuffer(l),
+		bitmap: bitmap,
+		itr: bitmap.NewIterator(),
 	}
-	bm.itr = bm.bitmap.NewIterator()
 	return bm
 }
 
@@ -798,7 +799,11 @@ func (it *roaringBitmapPostings) At() storage.SeriesRef {
 
 func (it *roaringBitmapPostings) Next() bool {
 	curr := it.itr.Next()
-	return curr != 0
+	if curr == 0 {
+		return false
+	}
+	it.curr = curr
+	return true
 }
 
 func (it *roaringBitmapPostings) Err() error {
