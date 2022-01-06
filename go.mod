@@ -1,4 +1,4 @@
-module github.com/prometheus/prometheus
+module github.com/Harkishen-Singh/prometheus-index-roaringbitmaps
 
 go 1.14
 

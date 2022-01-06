@@ -869,19 +869,16 @@ func (w *Writer) writePostingsToTmpFiles() error {
 	bitmapPool.Put(offsets)
 
 	for len(names) > 0 {
-		fmt.Println("into loop", names)
 		batchNames := []string{}
 		var c uint64
 		// Try to bunch up label names into one loop, but avoid
 		// using more memory than a single label name can.
 		for len(names) > 0 {
 			if w.labelNames[names[0]]+c > maxPostings {
-				fmt.Println("breaking")
 				break
 			}
 			batchNames = append(batchNames, names[0])
 			c += w.labelNames[names[0]]
-			fmt.Println("trimmed")
 			names = names[1:]
 		}
 
@@ -918,9 +915,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 						postings[lno][lvo] = bitmapPool.Get().(*sroar.Bitmap)
 					}
 
-					fmt.Println("setting", startPos / 16)
 					postings[lno][lvo].Set(startPos / 16)
-					//postings[lno][lvo] = append(postings[lno][lvo], uint32(startPos/16))
 				}
 			}
 			// Skip to next series.
@@ -947,13 +942,11 @@ func (w *Writer) writePostingsToTmpFiles() error {
 				if err != nil {
 					return err
 				}
-				fmt.Println("writing")
 				if err := w.writePosting(name, value, postings[sid][v]); err != nil {
 					return err
 				}
 				postings[sid][v].Reset()
 				bitmapPool.Put(postings[sid][v])
-				fmt.Println("writing done")
 			}
 		}
 		select {
@@ -971,7 +964,6 @@ func (w *Writer) writePosting(name, value string, correspondingSeriesIds *sroar.
 	if err := w.fP.AddPadding(4); err != nil {
 		return err
 	}
-	fmt.Println("writing", correspondingSeriesIds.ToArray())
 
 	// Write out postings offset table to temporary file as we go.
 	w.buf1.Reset()
@@ -1820,9 +1812,7 @@ func (dec *Decoder) Postings(b []byte) (int, Postings, error) {
 	//if len(l) != 4*n {
 	//	return 0, nil, fmt.Errorf("unexpected postings length, should be %d bytes for %d postings, got %d bytes", 4*n, n, len(l))
 	//}
-	np := newRoaringBitmapPostings(l)
-	fmt.Println("cardinality is", np.bitmap.GetCardinality(), "reading", np.bitmap.ToArray())
-	return n, np, nil
+	return n, newRoaringBitmapPostings(l), nil
 }
 
 // LabelNamesOffsetsFor decodes the offsets of the name symbols for a given series.
