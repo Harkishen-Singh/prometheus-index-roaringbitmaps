@@ -16,6 +16,7 @@ package index
 import (
 	"context"
 	"fmt"
+	"github.com/dgraph-io/sroar"
 	"hash/crc32"
 	"io/ioutil"
 	"math/rand"
@@ -47,17 +48,17 @@ type series struct {
 
 type mockIndex struct {
 	series   map[storage.SeriesRef]series
-	postings map[labels.Label][]storage.SeriesRef
+	postings map[labels.Label]*sroar.Bitmap
 	symbols  map[string]struct{}
 }
 
 func newMockIndex() mockIndex {
 	ix := mockIndex{
 		series:   make(map[storage.SeriesRef]series),
-		postings: make(map[labels.Label][]storage.SeriesRef),
+		postings: make(map[labels.Label]*sroar.Bitmap),
 		symbols:  make(map[string]struct{}),
 	}
-	ix.postings[allPostingsKey] = []storage.SeriesRef{}
+	ix.postings[allPostingsKey] = sroar.NewBitmap()
 	return ix
 }
 
@@ -73,11 +74,11 @@ func (m mockIndex) AddSeries(ref storage.SeriesRef, l labels.Labels, chunks ...c
 		m.symbols[lbl.Name] = struct{}{}
 		m.symbols[lbl.Value] = struct{}{}
 		if _, ok := m.postings[lbl]; !ok {
-			m.postings[lbl] = []storage.SeriesRef{}
+			m.postings[lbl] = sroar.NewBitmap()
 		}
-		m.postings[lbl] = append(m.postings[lbl], ref)
+		m.postings[lbl].Set(uint64(ref))
 	}
-	m.postings[allPostingsKey] = append(m.postings[allPostingsKey], ref)
+	m.postings[allPostingsKey].Set(uint64(ref))
 
 	s := series{l: l}
 	// Actual chunk data is not stored in the index.
@@ -104,20 +105,17 @@ func (m mockIndex) LabelValues(name string) ([]string, error) {
 	return values, nil
 }
 
-func (m mockIndex) Postings(name string, values ...string) (Postings, error) {
-	p := []Postings{}
+func (m mockIndex) Postings(name string, values ...string) (*sroar.Bitmap, error) {
+	p := []*sroar.Bitmap{}
 	for _, value := range values {
 		l := labels.Label{Name: name, Value: value}
-		p = append(p, m.SortedPostings(NewListPostings(m.postings[l])))
+		p = append(p, m.SortedPostings(m.postings[l]))
 	}
-	return Merge(p...), nil
+	return MergeBitmaps(p...), nil
 }
 
-func (m mockIndex) SortedPostings(p Postings) Postings {
-	ep, err := ExpandPostings(p)
-	if err != nil {
-		return ErrPostings(errors.Wrap(err, "expand postings"))
-	}
+func (m mockIndex) SortedPostings(p *sroar.Bitmap) *sroar.Bitmap {
+	ep, _ := ExpandPostingsBitmap(p)
 
 	sort.Slice(ep, func(i, j int) bool {
 		return labels.Compare(m.series[ep[i]].l, m.series[ep[j]].l) < 0
@@ -201,14 +199,15 @@ func TestIndexRW_Postings(t *testing.T) {
 	var l labels.Labels
 	var c []chunks.Meta
 
-	for i := 0; p.Next(); i++ {
-		err := ir.Series(p.At(), &l, &c)
-
+	itr := p.NewIterator()
+	i := 0
+	for v := itr.Next(); v != 0; v = itr.Next() {
+		err := ir.Series(storage.SeriesRef(v), &l, &c)
 		require.NoError(t, err)
 		require.Equal(t, 0, len(c))
 		require.Equal(t, series[i], l)
+		i++
 	}
-	require.NoError(t, p.Err())
 
 	// The label indices are no longer used, so test them by hand here.
 	labelIndices := map[string][]string{}
@@ -316,11 +315,11 @@ func TestPostingsMany(t *testing.T) {
 		got := []string{}
 		var lbls labels.Labels
 		var metas []chunks.Meta
-		for it.Next() {
-			require.NoError(t, ir.Series(it.At(), &lbls, &metas))
+		itr := it.NewIterator()
+		for v := itr.Next(); v != 0; v = itr.Next() {
+			require.NoError(t, ir.Series(storage.SeriesRef(v), &lbls, &metas))
 			got = append(got, lbls.Get("i"))
 		}
-		require.NoError(t, it.Err())
 		exp := []string{}
 		for _, e := range c.in {
 			if _, ok := symbols[e]; ok && e != "l" {
@@ -389,9 +388,9 @@ func TestPersistence_index_e2e(t *testing.T) {
 	mi := newMockIndex()
 
 	for i, s := range input {
-		err = iw.AddSeries(storage.SeriesRef(i), s.labels, s.chunks...)
+		err = iw.AddSeries(storage.SeriesRef(i+1), s.labels, s.chunks...)
 		require.NoError(t, err)
-		require.NoError(t, mi.AddSeries(storage.SeriesRef(i), s.labels, s.chunks...))
+		require.NoError(t, mi.AddSeries(storage.SeriesRef(i+1), s.labels, s.chunks...))
 
 		for _, l := range s.labels {
 			valset, ok := values[l.Name]
@@ -420,21 +419,21 @@ func TestPersistence_index_e2e(t *testing.T) {
 		var lset, explset labels.Labels
 		var chks, expchks []chunks.Meta
 
-		for gotp.Next() {
-			require.True(t, expp.Next())
+		gotItr := gotp.NewIterator()
+		expItr := expp.NewIterator()
+		for gotVal := gotItr.Next(); gotVal != 0; gotVal = gotItr.Next() {
+			expVal := expItr.Next()
+			require.True(t, expVal != 0) // Next returns 0 if there are no elements left.
 
-			ref := gotp.At()
-
-			err := ir.Series(ref, &lset, &chks)
+			err := ir.Series(storage.SeriesRef(gotVal), &lset, &chks)
 			require.NoError(t, err)
 
-			err = mi.Series(expp.At(), &explset, &expchks)
+			err = mi.Series(storage.SeriesRef(expVal), &explset, &expchks)
 			require.NoError(t, err)
 			require.Equal(t, explset, lset)
 			require.Equal(t, expchks, chks)
 		}
-		require.False(t, expp.Next(), "Expected no more postings for %q=%q", p.Name, p.Value)
-		require.NoError(t, gotp.Err())
+		require.True(t, expItr.Next() == 0, "Expected no more postings for %q=%q", p.Name, p.Value)
 	}
 
 	labelPairs := map[string][]string{}

@@ -1089,8 +1089,9 @@ func (h *Head) Delete(mint, maxt int64, ms ...*labels.Matcher) error {
 	}
 
 	var stones []tombstones.Stone
-	for p.Next() {
-		series := h.series.getByID(chunks.HeadSeriesRef(p.At()))
+	itr := p.NewIterator()
+	for v := itr.Next(); v != 0; v = itr.Next() {
+		series := h.series.getByID(chunks.HeadSeriesRef(v))
 
 		series.RLock()
 		t0, t1 := series.minTime(), series.maxTime()
@@ -1100,10 +1101,7 @@ func (h *Head) Delete(mint, maxt int64, ms ...*labels.Matcher) error {
 		}
 		// Delete only until the current values and not beyond.
 		t0, t1 = clampInterval(mint, maxt, t0, t1)
-		stones = append(stones, tombstones.Stone{Ref: p.At(), Intervals: tombstones.Intervals{{Mint: t0, Maxt: t1}}})
-	}
-	if p.Err() != nil {
-		return p.Err()
+		stones = append(stones, tombstones.Stone{Ref: storage.SeriesRef(v), Intervals: tombstones.Intervals{{Mint: t0, Maxt: t1}}})
 	}
 	if h.wal != nil {
 		var enc record.Encoder

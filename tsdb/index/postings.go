@@ -16,6 +16,7 @@ package index
 import (
 	"container/heap"
 	"encoding/binary"
+	"fmt"
 	"runtime"
 	"sort"
 	"sync"
@@ -201,7 +202,7 @@ func (p *MemPostings) Stats(label string) *PostingsStats {
 }
 
 // Get returns a postings list for the given label pair.
-func (p *MemPostings) Get(name, value string) Postings {
+func (p *MemPostings) Get(name, value string) *sroar.Bitmap {
 	var lp []storage.SeriesRef
 	p.mtx.RLock()
 	l := p.m[name]
@@ -211,13 +212,13 @@ func (p *MemPostings) Get(name, value string) Postings {
 	p.mtx.RUnlock()
 
 	if lp == nil {
-		return EmptyPostings()
+		return sroar.NewBitmap()
 	}
 	return newListPostings(lp...)
 }
 
 // All returns a postings list over all documents ever added.
-func (p *MemPostings) All() Postings {
+func (p *MemPostings) All() *sroar.Bitmap {
 	return p.Get(AllPostingsKey())
 }
 
@@ -334,7 +335,7 @@ func (p *MemPostings) Delete(deleted map[storage.SeriesRef]struct{}) {
 }
 
 // Iter calls f for each postings list. It aborts if f returns an error and returns it.
-func (p *MemPostings) Iter(f func(labels.Label, Postings) error) error {
+func (p *MemPostings) Iter(f func(labels.Label, *sroar.Bitmap) error) error {
 	p.mtx.RLock()
 	defer p.mtx.RUnlock()
 
@@ -390,6 +391,21 @@ func ExpandPostings(p Postings) (res []storage.SeriesRef, err error) {
 		res = append(res, p.At())
 	}
 	return res, p.Err()
+}
+
+// ExpandPostingsBitmap returns the bitmap postings expanded as a slice.
+func ExpandPostingsBitmap(p *sroar.Bitmap) (res []storage.SeriesRef, err error) {
+	s := p.ToArray()
+	for i := 0; i < len(s)-1; i++ {
+		if s[i] > s[i+1] {
+			fmt.Println(s)
+			panic("not sorted")
+		}
+	}
+	for _, si := range s {
+		res = append(res, storage.SeriesRef(si))
+	}
+	return res, nil
 }
 
 // Postings provides iterative access over a postings list.
@@ -503,6 +519,14 @@ func (it *intersectPostings) Err() error {
 		}
 	}
 	return nil
+}
+
+func IntersectBitmaps(b ...*sroar.Bitmap) *sroar.Bitmap {
+	return sroar.FastAnd(b...)
+}
+
+func MergeBitmaps(b ...*sroar.Bitmap) *sroar.Bitmap {
+	return sroar.FastOr(b...)
 }
 
 // Merge returns a new iterator over the union of the input iterators.
@@ -642,15 +666,13 @@ func (it mergedPostings) Err() error {
 
 // Without returns a new postings list that contains all elements from the full list that
 // are not in the drop list.
-func Without(full, drop Postings) Postings {
-	if full == EmptyPostings() {
-		return EmptyPostings()
-	}
-
-	if drop == EmptyPostings() {
+func Without(full, drop *sroar.Bitmap) *sroar.Bitmap {
+	if full.IsEmpty() || drop.IsEmpty() {
+		// If full is empty, return the same bitmap instead of returning a new bitmap.
 		return full
 	}
-	return newRemovedPostings(full, drop)
+	full.AndNot(drop)
+	return full
 }
 
 type removedPostings struct {
@@ -732,12 +754,16 @@ type ListPostings struct {
 	cur  storage.SeriesRef
 }
 
-func NewListPostings(list []storage.SeriesRef) Postings {
+func NewListPostings(list []storage.SeriesRef) *sroar.Bitmap {
 	return newListPostings(list...)
 }
 
-func newListPostings(list ...storage.SeriesRef) *ListPostings {
-	return &ListPostings{list: list}
+func newListPostings(list ...storage.SeriesRef) *sroar.Bitmap {
+	b := sroar.NewBitmap()
+	for _, l := range list {
+		b.Set(uint64(l))
+	}
+	return b
 }
 
 func (it *ListPostings) At() storage.SeriesRef {
@@ -786,11 +812,11 @@ type roaringBitmapPostings struct {
 	curr   uint64
 }
 
-func newRoaringBitmapPostings(l []byte) (*roaringBitmapPostings, error) {
+func newBitmapPostings(l []byte) (Postings, error) {
 	if len(l)%2 != 0 {
 		return nil, errors.New("byte len must be multiple of 2")
 	}
-	bitmap := sroar.FromBuffer(l) // todo: l may require a revisit in terms of capacity
+	bitmap := sroar.FromBufferWithCopy(l) // todo: l may require a revisit in terms of capacity
 	b := &roaringBitmapPostings{
 		bitmap: bitmap,
 		itr:    bitmap.NewIterator(),
@@ -877,31 +903,12 @@ func (x seriesRefSlice) Swap(i, j int)      { x[i], x[j] = x[j], x[i] }
 // FindIntersectingPostings checks the intersection of p and candidates[i] for each i in candidates,
 // if intersection is non empty, then i is added to the indexes returned.
 // Returned indexes are not sorted.
-func FindIntersectingPostings(p Postings, candidates []Postings) (indexes []int, err error) {
-	h := make(postingsWithIndexHeap, 0, len(candidates))
-	for idx, it := range candidates {
-		if it.Next() {
-			h = append(h, postingsWithIndex{index: idx, p: it})
-		} else if it.Err() != nil {
-			return nil, it.Err()
+func FindIntersectingPostings(p *sroar.Bitmap, candidates []*sroar.Bitmap) (indexes []int, err error) {
+	for i, c := range candidates {
+		if intersection := sroar.And(p, c); !intersection.IsEmpty() {
+			indexes = append(indexes, i)
 		}
 	}
-	if h.empty() {
-		return nil, nil
-	}
-	heap.Init(&h)
-
-	for !h.empty() {
-		if !p.Seek(h.at()) {
-			return indexes, p.Err()
-		}
-		if p.At() == h.at() {
-			indexes = append(indexes, h.popIndex())
-		} else if err := h.next(); err != nil {
-			return nil, err
-		}
-	}
-
 	return indexes, nil
 }
 

@@ -26,7 +26,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"sync"
 	"unsafe"
 
 	"github.com/dgraph-io/sroar"
@@ -816,17 +815,6 @@ func (w *Writer) writeTOC() error {
 	return w.write(w.buf1.Get())
 }
 
-var bitmapPool = sync.Pool{
-	New: func() interface{} {
-		return sroar.NewBitmap()
-	},
-}
-
-func putBitmap(b *sroar.Bitmap) {
-	b.Reset()
-	bitmapPool.Put(b)
-}
-
 func (w *Writer) writePostingsToTmpFiles() error {
 	names := make([]string, 0, len(w.labelNames))
 	for n := range w.labelNames {
@@ -844,8 +832,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 	defer f.Close()
 
 	// Write out the special all posting.
-	seriesIds := []uint64{}
-	seriesIdsBitmap := bitmapPool.Get().(*sroar.Bitmap)
+	seriesIdsBitmap := sroar.NewBitmap()
 	d := encoding.NewDecbufRaw(realByteSlice(f.Bytes()), int(w.toc.LabelIndices))
 	d.Skip(int(w.toc.Series))
 	for d.Len() > 0 {
@@ -854,7 +841,8 @@ func (w *Writer) writePostingsToTmpFiles() error {
 		if startPos%16 != 0 {
 			return errors.Errorf("series not 16-byte aligned at %d", startPos)
 		}
-		seriesIds = append(seriesIds, startPos/16)
+		seriesIdsBitmap.Set(startPos / 16)
+		// continue from here: print in main branch and compare the output of TestPersistence_index_e2e test.
 		// Skip to next series.
 		x := d.Uvarint()
 		d.Skip(x + crc32.Size)
@@ -862,7 +850,6 @@ func (w *Writer) writePostingsToTmpFiles() error {
 			return err
 		}
 	}
-	seriesIdsBitmap.SetMany(seriesIds)
 	maxPostings := uint64(seriesIdsBitmap.GetCardinality()) // No label name can have more postings than this.
 
 	if err := w.writePosting("", "", seriesIdsBitmap); err != nil {
@@ -913,7 +900,7 @@ func (w *Writer) writePostingsToTmpFiles() error {
 						postings[lno] = map[uint32]*sroar.Bitmap{}
 					}
 					if _, ok := postings[lno][lvo]; !ok {
-						postings[lno][lvo] = bitmapPool.Get().(*sroar.Bitmap)
+						postings[lno][lvo] = sroar.NewBitmap()
 					}
 					postings[lno][lvo].Set(startPos / 16)
 				}
@@ -976,8 +963,8 @@ func (w *Writer) writePosting(name, value string, postings *sroar.Bitmap) error 
 
 	w.buf1.Reset()
 	w.buf1.PutBE32int(postings.GetCardinality())
-	w.buf1.PutBytes(postings.ToBuffer())
-	putBitmap(postings)
+	bs := postings.ToBuffer()
+	w.buf1.PutBytes(bs)
 
 	w.buf2.Reset()
 	l := w.buf1.Len()
@@ -1631,13 +1618,13 @@ func (r *Reader) Series(id storage.SeriesRef, lbls *labels.Labels, chks *[]chunk
 	return errors.Wrap(r.dec.Series(d.Get(), lbls, chks), "read series")
 }
 
-func (r *Reader) Postings(name string, values ...string) (Postings, error) {
+func (r *Reader) Postings(name string, values ...string) (*sroar.Bitmap, error) {
 	if r.version == FormatV1 {
 		e, ok := r.postingsV1[name]
 		if !ok {
-			return EmptyPostings(), nil
+			return sroar.NewBitmap(), nil
 		}
-		res := make([]Postings, 0, len(values))
+		res := make([]*sroar.Bitmap, 0, len(values))
 		for _, v := range values {
 			postingsOff, ok := e[v]
 			if !ok {
@@ -1645,25 +1632,28 @@ func (r *Reader) Postings(name string, values ...string) (Postings, error) {
 			}
 			// Read from the postings table.
 			d := encoding.NewDecbufAt(r.b, int(postingsOff), castagnoliTable)
+			// todo harkishen: this will need another function so that it doesnt return bitmap, rather bigendian. This will be read on old blocks
+			// that work on big endian. For now, moving ahead with bitmap so that type checks do not complain.
+			// same for the below code. Hence, we need a v3 version of prometheus tsdb.
 			_, p, err := r.dec.Postings(d.Get())
 			if err != nil {
 				return nil, errors.Wrap(err, "decode postings")
 			}
 			res = append(res, p)
 		}
-		return Merge(res...), nil
+		return MergeBitmaps(res...), nil
 	}
 
 	e, ok := r.postings[name]
 	if !ok {
-		return EmptyPostings(), nil
+		return sroar.NewBitmap(), nil
 	}
 
 	if len(values) == 0 {
-		return EmptyPostings(), nil
+		return sroar.NewBitmap(), nil
 	}
 
-	res := make([]Postings, 0, len(values))
+	res := make([]*sroar.Bitmap, 0, len(values))
 	skip := 0
 	valueIndex := 0
 	for valueIndex < len(values) && values[valueIndex] < e[0].value {
@@ -1728,12 +1718,13 @@ func (r *Reader) Postings(name string, values ...string) (Postings, error) {
 		}
 	}
 
-	return Merge(res...), nil
+	return MergeBitmaps(res...), nil
 }
 
 // SortedPostings returns the given postings list reordered so that the backing series
 // are sorted.
-func (r *Reader) SortedPostings(p Postings) Postings {
+func (r *Reader) SortedPostings(p *sroar.Bitmap) *sroar.Bitmap {
+	// Bitmaps are always ordered.
 	return p
 }
 
@@ -1792,17 +1783,17 @@ type Decoder struct {
 }
 
 // Postings returns a postings list for b and its number of elements.
-func (dec *Decoder) Postings(b []byte) (int, Postings, error) {
+func (dec *Decoder) Postings(b []byte) (int, *sroar.Bitmap, error) {
 	d := encoding.Decbuf{B: b}
 	n := d.Be32int()
 	l := d.Get()
 	if d.Err() != nil {
 		return 0, nil, d.Err()
 	}
-	postings, err := newRoaringBitmapPostings(l)
-	if err != nil {
-		return 0, nil, errors.Wrap(err, "creating bitmap")
+	if len(b)%2 != 0 {
+		return 0, nil, errors.New("byte slice length should be multiple of 2")
 	}
+	postings := sroar.FromBufferWithCopy(l)
 	return n, postings, nil
 }
 

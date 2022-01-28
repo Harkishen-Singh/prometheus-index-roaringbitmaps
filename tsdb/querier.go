@@ -19,6 +19,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/dgraph-io/sroar"
 	"github.com/pkg/errors"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -223,8 +224,8 @@ func findSetMatches(pattern string) []string {
 
 // PostingsForMatchers assembles a single postings iterator against the index reader
 // based on the given matchers. The resulting postings are not ordered by series.
-func PostingsForMatchers(ix IndexReader, ms ...*labels.Matcher) (index.Postings, error) {
-	var its, notIts []index.Postings
+func PostingsForMatchers(ix IndexReader, ms ...*labels.Matcher) (*sroar.Bitmap, error) {
+	var its, notIts []*sroar.Bitmap
 	// See which label must be non-empty.
 	// Optimization for case like {l=~".", l!="1"}.
 	labelMustBeSet := make(map[string]bool, len(ms))
@@ -296,7 +297,7 @@ func PostingsForMatchers(ix IndexReader, ms ...*labels.Matcher) (index.Postings,
 		its = append(its, allPostings)
 	}
 
-	it := index.Intersect(its...)
+	it := index.IntersectBitmaps(its...)
 
 	for _, n := range notIts {
 		it = index.Without(it, n)
@@ -305,7 +306,7 @@ func PostingsForMatchers(ix IndexReader, ms ...*labels.Matcher) (index.Postings,
 	return it, nil
 }
 
-func postingsForMatcher(ix IndexReader, m *labels.Matcher) (index.Postings, error) {
+func postingsForMatcher(ix IndexReader, m *labels.Matcher) (*sroar.Bitmap, error) {
 	// This method will not return postings for missing labels.
 
 	// Fast-path for equal matching.
@@ -340,7 +341,7 @@ func postingsForMatcher(ix IndexReader, m *labels.Matcher) (index.Postings, erro
 	}
 
 	if len(res) == 0 {
-		return index.EmptyPostings(), nil
+		return sroar.NewBitmap(), nil
 	}
 
 	if !isSorted {
@@ -350,7 +351,7 @@ func postingsForMatcher(ix IndexReader, m *labels.Matcher) (index.Postings, erro
 }
 
 // inversePostingsForMatcher returns the postings for the series with the label name set but not matching the matcher.
-func inversePostingsForMatcher(ix IndexReader, m *labels.Matcher) (index.Postings, error) {
+func inversePostingsForMatcher(ix IndexReader, m *labels.Matcher) (*sroar.Bitmap, error) {
 	vals, err := ix.LabelValues(m.Name)
 	if err != nil {
 		return nil, err
@@ -384,7 +385,7 @@ func labelValuesWithMatchers(r IndexReader, name string, matchers ...*labels.Mat
 	if err != nil {
 		return nil, errors.Wrapf(err, "fetching values of label %s", name)
 	}
-	valuesPostings := make([]index.Postings, len(allValues))
+	valuesPostings := make([]*sroar.Bitmap, len(allValues))
 	for i, value := range allValues {
 		valuesPostings[i], err = r.Postings(name, value)
 		if err != nil {
@@ -410,12 +411,10 @@ func labelNamesWithMatchers(r IndexReader, matchers ...*labels.Matcher) ([]strin
 		return nil, err
 	}
 
+	itr := p.NewIterator()
 	var postings []storage.SeriesRef
-	for p.Next() {
-		postings = append(postings, p.At())
-	}
-	if p.Err() != nil {
-		return nil, errors.Wrapf(p.Err(), "postings for label names with matchers")
+	for seriesID := itr.Next(); seriesID != 0; seriesID = itr.Next() {
+		postings = append(postings, storage.SeriesRef(seriesID))
 	}
 
 	return r.LabelNamesFor(postings...)
@@ -425,7 +424,7 @@ func labelNamesWithMatchers(r IndexReader, matchers ...*labels.Matcher) ([]strin
 // Iterated series are trimmed with given min and max time as well as tombstones.
 // See newBlockSeriesSet and newBlockChunkSeriesSet to use it for either sample or chunk iterating.
 type blockBaseSeriesSet struct {
-	p               index.Postings
+	p               *sroar.Bitmap
 	index           IndexReader
 	chunks          ChunkReader
 	tombstones      tombstones.Reader
@@ -441,13 +440,15 @@ type blockBaseSeriesSet struct {
 }
 
 func (b *blockBaseSeriesSet) Next() bool {
-	for b.p.Next() {
-		if err := b.index.Series(b.p.At(), &b.bufLbls, &b.bufChks); err != nil {
+	itr := b.p.NewIterator()
+	for v := itr.Next(); v != 0; v = itr.Next() {
+		seriesId := storage.SeriesRef(v)
+		if err := b.index.Series(seriesId, &b.bufLbls, &b.bufChks); err != nil {
 			// Postings may be stale. Skip if no underlying series exists.
 			if errors.Cause(err) == storage.ErrNotFound {
 				continue
 			}
-			b.err = errors.Wrapf(err, "get series %d", b.p.At())
+			b.err = errors.Wrapf(err, "get series %d", seriesId)
 			return false
 		}
 
@@ -455,7 +456,7 @@ func (b *blockBaseSeriesSet) Next() bool {
 			continue
 		}
 
-		intervals, err := b.tombstones.Get(b.p.At())
+		intervals, err := b.tombstones.Get(seriesId)
 		if err != nil {
 			b.err = errors.Wrap(err, "get tombstones")
 			return false
@@ -518,10 +519,7 @@ func (b *blockBaseSeriesSet) Next() bool {
 }
 
 func (b *blockBaseSeriesSet) Err() error {
-	if b.err != nil {
-		return b.err
-	}
-	return b.p.Err()
+	return b.err
 }
 
 func (b *blockBaseSeriesSet) Warnings() storage.Warnings { return nil }
@@ -722,7 +720,7 @@ type blockSeriesSet struct {
 	blockBaseSeriesSet
 }
 
-func newBlockSeriesSet(i IndexReader, c ChunkReader, t tombstones.Reader, p index.Postings, mint, maxt int64, disableTrimming bool) storage.SeriesSet {
+func newBlockSeriesSet(i IndexReader, c ChunkReader, t tombstones.Reader, p *sroar.Bitmap, mint, maxt int64, disableTrimming bool) storage.SeriesSet {
 	return &blockSeriesSet{
 		blockBaseSeriesSet{
 			index:           i,
@@ -755,7 +753,7 @@ type blockChunkSeriesSet struct {
 	blockBaseSeriesSet
 }
 
-func newBlockChunkSeriesSet(i IndexReader, c ChunkReader, t tombstones.Reader, p index.Postings, mint, maxt int64, disableTrimming bool) storage.ChunkSeriesSet {
+func newBlockChunkSeriesSet(i IndexReader, c ChunkReader, t tombstones.Reader, p *sroar.Bitmap, mint, maxt int64, disableTrimming bool) storage.ChunkSeriesSet {
 	return &blockChunkSeriesSet{
 		blockBaseSeriesSet{
 			index:           i,

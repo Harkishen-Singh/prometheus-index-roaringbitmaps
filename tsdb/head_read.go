@@ -18,6 +18,7 @@ import (
 	"math"
 	"sort"
 
+	"github.com/dgraph-io/sroar"
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 
@@ -102,35 +103,35 @@ func (h *headIndexReader) LabelNames(matchers ...*labels.Matcher) ([]string, err
 }
 
 // Postings returns the postings list iterator for the label pairs.
-func (h *headIndexReader) Postings(name string, values ...string) (index.Postings, error) {
+func (h *headIndexReader) Postings(name string, values ...string) (*sroar.Bitmap, error) {
 	switch len(values) {
 	case 0:
-		return index.EmptyPostings(), nil
+		return sroar.NewBitmap(), nil // todo: harkishen: consider using nil instead of new bitmap for substituting empty postings.
 	case 1:
 		return h.head.postings.Get(name, values[0]), nil
 	default:
-		res := make([]index.Postings, 0, len(values))
+		res := make([]*sroar.Bitmap, 0, len(values))
 		for _, value := range values {
 			res = append(res, h.head.postings.Get(name, value))
 		}
-		return index.Merge(res...), nil
+		return index.MergeBitmaps(res...), nil
 	}
 }
 
-func (h *headIndexReader) SortedPostings(p index.Postings) index.Postings {
+func (h *headIndexReader) SortedPostings(p *sroar.Bitmap) *sroar.Bitmap {
+	// todo discussion (harkishen): this is wrong, as bitmap will always be sorted by the inputs in ascending order,
+	// but here, we want to sort by labels. Find a better way.
 	series := make([]*memSeries, 0, 128)
 
 	// Fetch all the series only once.
-	for p.Next() {
-		s := h.head.series.getByID(chunks.HeadSeriesRef(p.At()))
+	itr := p.NewIterator()
+	for v := itr.Next(); v != 0; v = itr.Next() {
+		s := h.head.series.getByID(chunks.HeadSeriesRef(v))
 		if s == nil {
 			level.Debug(h.head.logger).Log("msg", "Looked up series not found")
 		} else {
 			series = append(series, s)
 		}
-	}
-	if err := p.Err(); err != nil {
-		return index.ErrPostings(errors.Wrap(err, "expand postings"))
 	}
 
 	sort.Slice(series, func(i, j int) bool {

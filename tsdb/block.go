@@ -23,6 +23,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/dgraph-io/sroar"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid"
@@ -74,11 +75,11 @@ type IndexReader interface {
 	// The Postings here contain the offsets to the series inside the index.
 	// Found IDs are not strictly required to point to a valid Series, e.g.
 	// during background garbage collections. Input values must be sorted.
-	Postings(name string, values ...string) (index.Postings, error)
+	Postings(name string, values ...string) (*sroar.Bitmap, error)
 
 	// SortedPostings returns a postings list that is reordered to be sorted
 	// by the label set of the underlying series.
-	SortedPostings(index.Postings) index.Postings
+	SortedPostings(bitmap *sroar.Bitmap) *sroar.Bitmap
 
 	// Series populates the given labels and chunk metas for the series identified
 	// by the reference.
@@ -461,7 +462,7 @@ func (r blockIndexReader) LabelNames(matchers ...*labels.Matcher) ([]string, err
 	return labelNamesWithMatchers(r.ir, matchers...)
 }
 
-func (r blockIndexReader) Postings(name string, values ...string) (index.Postings, error) {
+func (r blockIndexReader) Postings(name string, values ...string) (*sroar.Bitmap, error) {
 	p, err := r.ir.Postings(name, values...)
 	if err != nil {
 		return p, errors.Wrapf(err, "block: %s", r.b.Meta().ULID)
@@ -469,7 +470,7 @@ func (r blockIndexReader) Postings(name string, values ...string) (index.Posting
 	return p, nil
 }
 
-func (r blockIndexReader) SortedPostings(p index.Postings) index.Postings {
+func (r blockIndexReader) SortedPostings(p *sroar.Bitmap) *sroar.Bitmap {
 	return r.ir.SortedPostings(p)
 }
 
@@ -538,9 +539,10 @@ func (pb *Block) Delete(mint, maxt int64, ms ...*labels.Matcher) error {
 	var lset labels.Labels
 	var chks []chunks.Meta
 
+	itr := p.NewIterator()
 Outer:
-	for p.Next() {
-		err := ir.Series(p.At(), &lset, &chks)
+	for v := itr.Next(); v != 0; v = itr.Next() {
+		err := ir.Series(storage.SeriesRef(v), &lset, &chks)
 		if err != nil {
 			return err
 		}
@@ -549,14 +551,10 @@ Outer:
 			if chk.OverlapsClosedInterval(mint, maxt) {
 				// Delete only until the current values and not beyond.
 				tmin, tmax := clampInterval(mint, maxt, chks[0].MinTime, chks[len(chks)-1].MaxTime)
-				stones.AddInterval(p.At(), tombstones.Interval{Mint: tmin, Maxt: tmax})
+				stones.AddInterval(storage.SeriesRef(v), tombstones.Interval{Mint: tmin, Maxt: tmax})
 				continue Outer
 			}
 		}
-	}
-
-	if p.Err() != nil {
-		return p.Err()
 	}
 
 	err = pb.tombstones.Iter(func(id storage.SeriesRef, ivs tombstones.Intervals) error {
