@@ -13,7 +13,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.1.2
 	github.com/containerd/containerd v1.5.7 // indirect
 	github.com/dennwc/varint v1.0.0
-	github.com/dgraph-io/sroar v0.0.0-20211209113350-3e3f1b382a64 // indirect
+	github.com/dgraph-io/sroar v0.0.0-20211209113350-3e3f1b382a64
 	github.com/dgryski/go-sip13 v0.0.0-20200911182023-62edffca9245
 	github.com/digitalocean/godo v1.73.0
 	github.com/docker/docker v20.10.11+incompatible
@@ -52,6 +52,7 @@ require (
 	github.com/prometheus/common v0.32.1
 	github.com/prometheus/common/sigv4 v0.1.0
 	github.com/prometheus/exporter-toolkit v0.7.0
+	github.com/prometheus/prometheus v0.0.0-20200609090129-a6600f564e3c
 	github.com/scaleway/scaleway-sdk-go v1.0.0-beta.7.0.20210223165440-c65ae3540d44
 	github.com/shurcooL/httpfs v0.0.0-20190707220628-8d4bc4ba7749
 	github.com/shurcooL/vfsgen v0.0.0-20200824052919-0d455de96546
@@ -60,7 +61,7 @@ require (
 	github.com/uber/jaeger-lib v2.4.1+incompatible
 	go.uber.org/atomic v1.9.0
 	go.uber.org/goleak v1.1.12
-	golang.org/x/net v0.0.0-20211123203042-d83791d6bcd9
+	golang.org/x/net v0.0.0-20211209124913-491a49abca63
 	golang.org/x/oauth2 v0.0.0-20211104180415-d3ed0bb246c8
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
 	golang.org/x/sys v0.0.0-20211124211545-fe61309f8881
@@ -68,13 +69,14 @@ require (
 	golang.org/x/tools v0.1.8
 	google.golang.org/api v0.61.0
 	google.golang.org/genproto v0.0.0-20211129164237-f09f9a12af12
+	google.golang.org/grpc/examples v0.0.0-20220218222403-011544f72939 // indirect
 	google.golang.org/protobuf v1.27.1
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/yaml.v2 v2.4.0
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b
-	k8s.io/api v0.23.0
-	k8s.io/apimachinery v0.23.0
-	k8s.io/client-go v0.23.0
+	k8s.io/api v0.23.4
+	k8s.io/apimachinery v0.23.4
+	k8s.io/client-go v0.23.4
 	k8s.io/klog v1.0.0
 	k8s.io/klog/v2 v2.30.0
 )
